@@ -2,26 +2,49 @@
 # crawler.py
 # =========================
 
+import posixpath
 import re
-from collections import deque
+from collections import defaultdict, deque
 from urllib.parse import parse_qsl, urlencode, urldefrag, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
 
-MAX_URLS = 200
+MAX_URLS = 300
+MAX_DEPTH = 4
+MAX_VARIANTS_PER_PATH = 8
 REQUEST_TIMEOUT = 5
 HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
-DISCOVERY_ATTRS = ("href", "src", "action", "data-url", "data-href", "data-endpoint")
-SCRIPT_URL_PATTERN = re.compile(
-    r"""
-    (?:
-        ["'](?P<quoted>/[^"'?#\s][^"'#\s]*)["']
-        |
-        (?P<api>/api/[^"'?#\s]+)
-    )
-    """,
-    re.VERBOSE,
+DISCOVERY_ATTRS = (
+    "href",
+    "src",
+    "action",
+    "formaction",
+    "data-url",
+    "data-href",
+    "data-endpoint",
+    "data-action",
+    "poster",
+)
+DANGEROUS_ROUTE_KEYWORDS = (
+    "logout",
+    "log-out",
+    "signout",
+    "sign-out",
+    "delete",
+    "remove",
+    "destroy",
+    "truncate",
+    "drop",
+    "reset",
+    "purge",
+)
+JAVASCRIPT_ENDPOINT_PATTERNS = (
+    re.compile(r"""fetch\(\s*["']([^"'?#\s][^"'#\s]*)["']""", re.IGNORECASE),
+    re.compile(r"""open\(\s*["'](?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)["']\s*,\s*["']([^"'?#\s][^"'#\s]*)["']""", re.IGNORECASE),
+    re.compile(r"""url\s*:\s*["']([^"'?#\s][^"'#\s]*)["']""", re.IGNORECASE),
+    re.compile(r"""(?:api|endpoint|route|path)\s*:\s*["']([^"'?#\s][^"'#\s]*)["']""", re.IGNORECASE),
+    re.compile(r"""["']((?:/|\.{1,2}/)[^"'#\s<>]+)["']"""),
 )
 
 
@@ -34,10 +57,13 @@ def crawl_website(base_url):
     session = requests.Session()
     visited = set()
     discovered = set()
-    queue = deque([start_url])
+    queued = {start_url}
+    queue = deque([(start_url, 0)])
+    path_variant_counts = defaultdict(int)
 
     while queue and len(visited) < MAX_URLS:
-        current_url = queue.popleft()
+        current_url, depth = queue.popleft()
+        queued.discard(current_url)
 
         if current_url in visited:
             continue
@@ -51,30 +77,75 @@ def crawl_website(base_url):
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=True,
             )
-            final_url = _normalize_discovered_url(response.url, start_url)
         except requests.RequestException:
             continue
 
-        if final_url and _is_same_origin(final_url, origin):
+        final_url = _normalize_discovered_url(response.url, current_url)
+        if final_url and _is_same_origin(final_url, origin) and not _is_dangerous_route(final_url):
             discovered.add(final_url)
+            _enqueue_candidate(
+                final_url,
+                depth,
+                MAX_DEPTH,
+                visited,
+                queued,
+                queue,
+                path_variant_counts,
+            )
+
+        if depth >= MAX_DEPTH:
+            continue
 
         content_type = response.headers.get("Content-Type", "").lower()
         if not any(content_type.startswith(value) for value in HTML_CONTENT_TYPES):
             continue
 
+        page_url = final_url or current_url
         soup = BeautifulSoup(response.text, "html.parser")
-        candidates = set(_extract_candidate_urls(soup, response.text, final_url or current_url))
 
-        for candidate in candidates:
+        for candidate in _extract_candidate_urls(soup, response.text, page_url):
             if not _is_same_origin(candidate, origin):
                 continue
 
-            discovered.add(candidate)
+            if _is_dangerous_route(candidate):
+                continue
 
-            if candidate not in visited and candidate not in queue and len(visited) + len(queue) < MAX_URLS:
-                queue.append(candidate)
+            discovered.add(candidate)
+            _enqueue_candidate(
+                candidate,
+                depth,
+                MAX_DEPTH,
+                visited,
+                queued,
+                queue,
+                path_variant_counts,
+            )
 
     return sorted(discovered)
+
+
+def _enqueue_candidate(
+    candidate,
+    depth,
+    max_depth,
+    visited,
+    queued,
+    queue,
+    path_variant_counts,
+):
+    if candidate in visited or candidate in queued:
+        return
+
+    if depth + 1 > max_depth:
+        return
+
+    path_key = _path_variant_key(candidate)
+    if path_variant_counts[path_key] >= MAX_VARIANTS_PER_PATH:
+        return
+
+    path_variant_counts[path_key] += 1
+    queued.add(candidate)
+    queue.append((candidate, depth + 1))
 
 
 def _extract_candidate_urls(soup, html, page_url):
@@ -86,28 +157,86 @@ def _extract_candidate_urls(soup, html, page_url):
                 if normalized:
                     yield normalized
 
+        srcset = tag.get("srcset")
+        if srcset:
+            for raw_value in _parse_srcset(srcset):
+                normalized = _normalize_discovered_url(raw_value, page_url)
+                if normalized:
+                    yield normalized
+
     for form in soup.find_all("form"):
-        action = form.get("action") or page_url
-        action_url = _normalize_discovered_url(action, page_url)
-        if action_url:
-            yield action_url
+        for candidate in _extract_form_targets(form, page_url):
+            yield candidate
 
-        params = []
-        for field in form.find_all(["input", "textarea", "select"]):
-            name = field.get("name")
-            if name:
-                params.append((name, field.get("value", "")))
+    for candidate in _extract_javascript_urls(html, page_url):
+        yield candidate
 
-        if action_url and params:
-            dynamic_url = _merge_query_params(action_url, params)
-            if dynamic_url:
-                yield dynamic_url
 
-    for match in SCRIPT_URL_PATTERN.finditer(html):
-        raw_url = match.group("quoted") or match.group("api")
-        normalized = _normalize_discovered_url(raw_url, page_url)
-        if normalized:
-            yield normalized
+def _extract_form_targets(form, page_url):
+    action = form.get("action") or page_url
+    action_url = _normalize_discovered_url(action, page_url)
+    if not action_url:
+        return
+
+    yield action_url
+
+    method = (form.get("method") or "get").strip().lower()
+    fields = _extract_form_fields(form)
+    if not fields:
+        return
+
+    if method == "get":
+        dynamic_url = _merge_query_params(action_url, fields)
+        if dynamic_url:
+            yield dynamic_url
+
+
+def _extract_form_fields(form):
+    params = []
+
+    for field in form.find_all(["input", "textarea", "select"]):
+        name = field.get("name")
+        if not name:
+            continue
+
+        field_type = (field.get("type") or "").strip().lower()
+        if field_type in {"submit", "button", "image", "file", "reset"}:
+            continue
+
+        value = field.get("value", "")
+        if field.name == "textarea":
+            value = field.text or value
+        elif field.name == "select":
+            selected_option = field.find("option", selected=True)
+            if selected_option:
+                value = selected_option.get("value", selected_option.text)
+            else:
+                first_option = field.find("option")
+                if first_option:
+                    value = first_option.get("value", first_option.text)
+
+        params.append((name, value))
+
+    return params
+
+
+def _extract_javascript_urls(html, page_url):
+    seen = set()
+
+    for pattern in JAVASCRIPT_ENDPOINT_PATTERNS:
+        for match in pattern.finditer(html):
+            raw_url = match.group(1)
+            normalized = _normalize_discovered_url(raw_url, page_url)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                yield normalized
+
+
+def _parse_srcset(srcset):
+    for item in srcset.split(","):
+        value = item.strip().split(" ", 1)[0]
+        if value:
+            yield value
 
 
 def _normalize_seed_url(url):
@@ -129,7 +258,11 @@ def _normalize_discovered_url(candidate, page_url):
         return None
 
     raw_value = candidate.strip()
-    if not raw_value or raw_value.startswith(("#", "javascript:", "mailto:", "tel:")):
+    if not raw_value:
+        return None
+
+    lowered = raw_value.lower()
+    if lowered.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
         return None
 
     absolute_url = urljoin(page_url, raw_value)
@@ -146,19 +279,42 @@ def _canonicalize_url(url):
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return None
 
-    normalized_path = parsed.path or "/"
-    normalized_query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)), doseq=True)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return None
 
-    return urlunparse(
-        (
-            parsed.scheme.lower(),
-            parsed.netloc.lower(),
-            normalized_path,
-            "",
-            normalized_query,
-            "",
-        )
+    port = parsed.port
+    if port and not _is_default_port(scheme, port):
+        netloc = f"{hostname}:{port}"
+    else:
+        netloc = hostname
+
+    normalized_path = _normalize_path(parsed.path)
+    normalized_query = urlencode(
+        sorted(parse_qsl(parsed.query, keep_blank_values=True)),
+        doseq=True,
     )
+
+    return urlunparse((scheme, netloc, normalized_path, "", normalized_query, ""))
+
+
+def _normalize_path(path):
+    raw_path = path or "/"
+    collapsed = re.sub(r"/{2,}", "/", raw_path)
+
+    normalized = posixpath.normpath(collapsed)
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+
+    if collapsed.endswith("/") and normalized != "/":
+        normalized += "/"
+
+    return normalized
+
+
+def _is_default_port(scheme, port):
+    return (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
 
 
 def _origin_tuple(url):
@@ -181,8 +337,21 @@ def _merge_query_params(url, params):
             parsed.scheme,
             parsed.netloc,
             parsed.path,
-            parsed.params,
+            "",
             query,
             "",
         )
     )
+
+
+def _path_variant_key(url):
+    parsed = urlparse(url)
+    return (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path)
+
+
+def _is_dangerous_route(url):
+    parsed = urlparse(url)
+    combined = "/".join(
+        piece for piece in (parsed.path, parsed.query) if piece
+    ).lower()
+    return any(keyword in combined for keyword in DANGEROUS_ROUTE_KEYWORDS)
